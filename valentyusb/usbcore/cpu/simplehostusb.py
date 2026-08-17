@@ -4,7 +4,7 @@ from enum import IntEnum
 
 from migen import *
 from migen.genlib import fifo
-from migen.genlib.cdc import MultiReg, PulseSynchronizer, BusSynchronizer, BlindTransfer
+from migen.genlib.cdc import MultiReg, PulseSynchronizer, BlindTransfer
 
 from litex.soc.integration.doc import AutoDoc, ModuleDoc
 from litex.soc.interconnect import stream
@@ -34,7 +34,7 @@ class SimpleHostUsb(Module, AutoCSR, AutoDoc):
 
         ems = []
 
-        self.submodules.sof = sof = SOFHandler(usb_core, cdc=cdc)
+        self.submodules.sof = sof = SOFHandler(usb_core, cdc=cdc, low_speed_support=True)
         ems.append(sof.ev)
 
         self.submodules.transfer = transfer = TransferHandler(usb_core, cdc=cdc)
@@ -88,17 +88,30 @@ class SimpleHostUsb(Module, AutoCSR, AutoDoc):
 
 class SOFHandler(Module, AutoCSR):
 
-    def __init__(self, usb_core, cdc=False):
+    def __init__(self, usb_core, cdc=False, low_speed_support=False):
         self.frame = frame = Signal(11)
-        counter = Signal(max=12000)
         self.sof_pulse = new_frame = Signal()
+        self.submodules.ev = ev.EventManager()
+        self.ev.submodules.new_frame = ev.EventSourcePulse(name="new_frame")
+        self.ev.finalize()
+
+        # Use a wide counter; limit is selectable per domain
+        counter = Signal(18)
+        self.sync.usb_12 += If(new_frame, frame.eq(frame+1))
+        if low_speed_support and cdc:
+            # Low-speed: 20ms = 240000 cycles @ 12MHz
+            sof_limit = 240000 - 1
+        else:
+            # Full-speed: 1ms = 12000 cycles @ 12MHz
+            sof_limit = 12000 - 1
         self.sync.usb_12 += [
-            If (counter == 11999,
-                counter.eq(0),
-                frame.eq(frame+1),
-                new_frame.eq(1)
-            ).Else(counter.eq(counter+1),
-                   new_frame.eq(0))
+            If(counter == sof_limit,
+               counter.eq(0),
+               new_frame.eq(1)
+            ).Else([
+               counter.eq(counter+1),
+               new_frame.eq(0),
+            ])
         ]
 
         self.frame_csr = CSRStatus(name="frame",
@@ -171,7 +184,12 @@ class TransferHandler(Module, AutoCSR):
             description="""
                 Starts transfers."""
         )
-        cmd.dat_w.eq(cmd.storage & 0xffff) # Clear upper 16 bits on cmd_latched
+        # cmd.dat_w.eq(cmd.storage & 0xffff) # Clear upper 16 bits on cmd_latched
+
+        # Fix: wire dat_w to storage so the FSM's write_from_dev path doesn't
+        # zero out the storage register when it asserts we (latched_s_o).
+        # Without this, the CPU CSR write to storage gets immediately overwritten by 0.
+        self.comb += self.cmd.dat_w.eq(self.cmd.storage)
 
         self.command = Record([(f.name, f.size) for f in cmd.fields.fields])
 
@@ -237,15 +255,17 @@ class TransferHandler(Module, AutoCSR):
                 self.cmd_latched_s.i.eq(usb_core.o_cmd_latched),
                 cmd.we.eq(self.cmd_latched_s.o)
             ]
-            self.submodules.cmd_s = BusSynchronizer(len(self.command), 'sys', 'usb_12')
-            command_sys = Record(self.command.layout)
+           # CDC from sys to usb_12: trigger on cmd.wr_stb.
+            # Use MultiReg directly — data changes only on wr_stb so no
+            # extra handshake needed.  The pulse sync handles the domain
+            # crossing; MultiReg ensures all bits cross as one word.
+            cmd_sync_i = Signal(len(cmd.storage), reset_less=True)
+            cmd_sync_o = Signal(len(cmd.storage), reset_less=True)
+            self.sync.sys += If(cmd.wr_stb, cmd_sync_i.eq(cmd.storage))
+            self.specials += MultiReg(cmd_sync_i, cmd_sync_o, "usb_12")
             self.comb += [
-                self.cmd_s.i.eq(command_sys.raw_bits()),
-                self.command.raw_bits().eq(self.cmd_s.o),
-            ]
-            self.comb += [
-                getattr(command_sys, f.name).eq(
-                    cmd.storage[f.offset:f.offset+f.size]
+                getattr(self.command, f.name).eq(
+                    cmd_sync_o[f.offset:f.offset+f.size]
                 ) for f in cmd.fields.fields
             ]
         else:
