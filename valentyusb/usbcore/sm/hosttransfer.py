@@ -61,6 +61,7 @@ class UsbHostTransfer(Module):
 
         cmd_data1 = Signal()
         cmd_iso = Signal()
+        cmd_active = Signal()
         low_speed_override = Signal()
         sof_latch = Signal()
 
@@ -95,14 +96,13 @@ class UsbHostTransfer(Module):
 
         fsm.act('IDLE',
                 NextValue(low_speed_override, 0),
-                If (sof_latch,
-                    If (low_speed,
-                        NextState('KA' if low_speed_support else 'SOF')
-                    ).Else (NextState('SOF'))
-                ).Elif (self.i_cmd_setup | self.i_cmd_in | self.i_cmd_out,
+                If (~cmd_active & (self.i_cmd_setup | self.i_cmd_in | self.i_cmd_out),
                    If (self.i_cmd_pre,
                        NextState('PREAMBLE')
-                   ).Else (NextState('START_TRANSFER'))))
+                   ).Else (NextState('START_TRANSFER'))).Elif (sof_latch,
+                    If (low_speed,
+                        NextState('KA' if low_speed_support else 'SOF')
+                    ).Else (NextState('SOF'))))
 
         fsm.act('SOF',
                 txstate.i_pkt_start.eq(1),
@@ -124,6 +124,7 @@ class UsbHostTransfer(Module):
                 self.o_cmd_latched.eq(1),
                 NextValue(cmd_data1, self.i_cmd_data1),
                 NextValue(cmd_iso, self.i_cmd_iso),
+                NextValue(cmd_active, 1),
                 If (self.i_cmd_setup,
                         NextState('SETUP')
                 ).Elif (self.i_cmd_in,
@@ -136,7 +137,9 @@ class UsbHostTransfer(Module):
                 txstate.i_pkt_start.eq(1),
                 txstate.i_pid.eq(PID.SETUP),
                 If (txstate.o_pkt_end,
-                    NextState('SEND_DATA')))
+                    If (self.i_cmd_out,
+                       NextState('SEND_DATA')
+                    ).Else (NextState('WAIT_REPLY'))))
 
         fsm.act('IN',
                 txstate.i_pkt_start.eq(1),
@@ -161,6 +164,7 @@ class UsbHostTransfer(Module):
                     ).Else(NextState('WAIT_REPLY'))))
 
         fsm.act('WAIT_REPLY',
+                NextValue(cmd_active, 0),
                 If (rxstate.o_decoded,
                     If ((rxstate.o_pid & PIDTypes.TYPE_MASK) == PIDTypes.DATA,
                         NextState('RECV_DATA')
@@ -168,7 +172,7 @@ class UsbHostTransfer(Module):
                             self.o_got_ack.eq(rxstate.o_pid == PID.ACK),
                             self.o_got_nak.eq(rxstate.o_pid == PID.NAK),
                             self.o_got_stall.eq(rxstate.o_pid == PID.STALL))
-                ).Elif(self.i_cmd_setup | self.i_cmd_in | self.i_cmd_out,
+                ).Elif(~cmd_active & (self.i_cmd_setup | self.i_cmd_in | self.i_cmd_out),
                        NextValue(low_speed_override, 0),
                        If (self.i_cmd_pre,
                            NextState('PREAMBLE')
