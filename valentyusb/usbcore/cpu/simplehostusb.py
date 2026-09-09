@@ -48,7 +48,8 @@ class SimpleHostUsb(Module, AutoCSR, AutoDoc):
         self.ctrl = CSRStorage(
             fields=[CSRField("reset", 1, description="Set to ``1`` to reset the USB bus."),
                     CSRField("low_speed", 1, description="Set to ``1`` to switch root port to low speed mode."),
-                    CSRField("sof_enable", 1, description="Set to ``1`` to enable transmission of SOF packets.")])
+                    CSRField("sof_enable", 1, description="Set to ``1`` to enable transmission of SOF packets."),
+                    CSRField("flush", 1, description="Hold at ``1`` to reset both transfer data FIFOs, then write ``0``. Use to discard a partial or stale transfer.")])
 
         sof_enabled = Signal()
 
@@ -60,10 +61,12 @@ class SimpleHostUsb(Module, AutoCSR, AutoDoc):
             ]
         else:
             self.comb += [
-                self.crc_core.i_reset.eq(self.ctrl.fields.reset),
-                self.crc_core.i_low_speed.eq(self.ctrl.fields.low_speed),
+                self.usb_core.i_reset.eq(self.ctrl.fields.reset),
+                self.usb_core.i_low_speed.eq(self.ctrl.fields.low_speed),
                 sof_enabled.eq(self.ctrl.fields.sof_enable)
             ]
+
+        self.comb += transfer.flush.eq(self.ctrl.fields.flush)
 
         self.comb += [
             transfer.data_out_advance.eq(usb_core.data_send_get),
@@ -128,6 +131,9 @@ class SOFHandler(Module, AutoCSR):
 class TransferHandler(Module, AutoCSR):
 
     def __init__(self, usb_core, cdc=False):
+        # Level (sys domain).  Hold high to reset both data FIFOs; see ctrl.flush.
+        self.flush = Signal()
+
         if cdc:
             self.submodules.write_data_buf = write_buf = ResetInserter(["usb_12", "sys"])(ClockDomainsRenamer({"write":"sys","read":"usb_12"})(fifo.AsyncFIFOBuffered(width=8, depth=64)))
             self.submodules.read_data_buf = read_buf = ResetInserter(["usb_12", "sys"])(ClockDomainsRenamer({"write":"usb_12","read":"sys"})(fifo.AsyncFIFOBuffered(width=8, depth=128))) # 66
@@ -171,7 +177,9 @@ class TransferHandler(Module, AutoCSR):
             description="""
                 Starts transfers."""
         )
-        cmd.dat_w.eq(cmd.storage & 0xffff) # Clear upper 16 bits on cmd_latched
+        # Clear the command bits (16..21) on o_cmd_latched but keep addr/epno,
+        # which the token generator is still sampling while the packet goes out.
+        self.comb += cmd.dat_w.eq(cmd.storage & 0xffff)
 
         self.command = Record([(f.name, f.size) for f in cmd.fields.fields])
 
@@ -189,6 +197,7 @@ class TransferHandler(Module, AutoCSR):
         self.ev.submodules.got_stall = ev.EventSourcePulse(name="stall", description="Got a ``STALL`` packet")
         self.ev.submodules.got_data0 = ev.EventSourcePulse(name="data0", description="Got a ``DATA0`` packet")
         self.ev.submodules.got_data1 = ev.EventSourcePulse(name="data1", description="Got a ``DATA1`` packet")
+        self.ev.submodules.got_timeout = ev.EventSourcePulse(name="timeout", description="The device did not reply in time")
         self.ev.finalize()
 
         self.data_out = Signal(8)
@@ -204,6 +213,7 @@ class TransferHandler(Module, AutoCSR):
             self.submodules.stallsync = BlindTransfer('usb_12', 'sys')
             self.submodules.data0sync = BlindTransfer('usb_12', 'sys')
             self.submodules.data1sync = BlindTransfer('usb_12', 'sys')
+            self.submodules.timeoutsync = BlindTransfer('usb_12', 'sys')
             self.comb += [
                 self.acksync.i.eq(usb_core.o_got_ack),
                 self.ev.got_ack.trigger.eq(self.acksync.o),
@@ -215,6 +225,8 @@ class TransferHandler(Module, AutoCSR):
                 self.ev.got_data0.trigger.eq(self.data0sync.o),
                 self.data1sync.i.eq(usb_core.o_got_data1),
                 self.ev.got_data1.trigger.eq(self.data1sync.o),
+                self.timeoutsync.i.eq(usb_core.o_timeout),
+                self.ev.got_timeout.trigger.eq(self.timeoutsync.o),
             ]
 
             self.comb += [
@@ -230,6 +242,17 @@ class TransferHandler(Module, AutoCSR):
                 self.status.fields.have.eq(read_buf.readable),
                 self.data_in_fifo.fields.data.eq(read_buf.dout),
                 read_buf.re.eq(self.data_in_fifo.we)
+            ]
+
+            # R4: the ResetInserter inputs were left dangling, so there was no
+            # way to discard a stale/partial FIFO after an aborted transfer.
+            flush_usb_12 = Signal()
+            self.specials += MultiReg(self.flush, flush_usb_12, odomain="usb_12")
+            self.comb += [
+                write_buf.reset_sys.eq(self.flush),
+                read_buf.reset_sys.eq(self.flush),
+                write_buf.reset_usb_12.eq(flush_usb_12),
+                read_buf.reset_usb_12.eq(flush_usb_12),
             ]
 
             self.submodules.cmd_latched_s = PulseSynchronizer('usb_12', 'sys')
@@ -255,6 +278,9 @@ class TransferHandler(Module, AutoCSR):
                 self.ev.got_stall.trigger.eq(usb_core.o_got_stall),
                 self.ev.got_data0.trigger.eq(usb_core.o_got_data0),
                 self.ev.got_data1.trigger.eq(usb_core.o_got_data1),
+                self.ev.got_timeout.trigger.eq(usb_core.o_timeout),
+                write_buf.reset.eq(self.flush),
+                read_buf.reset.eq(self.flush),
             ]
 
             self.comb += [

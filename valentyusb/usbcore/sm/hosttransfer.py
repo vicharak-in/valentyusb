@@ -58,9 +58,23 @@ class UsbHostTransfer(Module):
         self.o_got_stall = Signal()
         self.o_got_data0 = Signal()
         self.o_got_data1 = Signal()
+        self.o_timeout = Signal()
 
         cmd_data1 = Signal()
         cmd_iso = Signal()
+        # R2: bus-turnaround watchdog for WAIT_REPLY.  Counted in usb_12 clocks;
+        # one bit time is 8 clocks at low speed and 1 at full speed, so this is
+        # 64 bit times either way -- comfortably more than the 16..18 the spec
+        # requires, but far below the 1ms frame interval.
+        reply_timeout = Signal(10)
+        reply_limit = Signal(10)
+        # R3: RECV_DATA strobes every decoded byte, including the two CRC16
+        # bytes at the end of the packet.  Delay the payload by two bytes so
+        # the CRC is still sitting in the skid when the packet ends.
+        recv_b0 = Signal(8)
+        recv_b1 = Signal(8)
+        recv_cnt = Signal(2)
+        recv_strobe = Signal()
         low_speed_override = Signal()
         sof_latch = Signal()
 
@@ -88,6 +102,8 @@ class UsbHostTransfer(Module):
         ]
 
         self.sync.usb_12 += If(self.i_sof, sof_latch.eq(1))
+
+        self.comb += reply_limit.eq(Mux(low_speed, 64*8, 64))
 
         fsm = ResetInserter()(FSM(reset_state='IDLE'))
         self.submodules.fsm = fsm = ClockDomainsRenamer('usb_12')(fsm)
@@ -142,6 +158,7 @@ class UsbHostTransfer(Module):
                 txstate.i_pkt_start.eq(1),
                 txstate.i_pid.eq(PID.IN),
                 If (txstate.o_pkt_end,
+                    NextValue(reply_timeout, 0),
                     NextState('WAIT_REPLY')))
 
         fsm.act('OUT',
@@ -158,9 +175,11 @@ class UsbHostTransfer(Module):
                 If (txstate.o_pkt_end,
                     If(cmd_iso,
                        NextState('IDLE')
-                    ).Else(NextState('WAIT_REPLY'))))
+                    ).Else(NextValue(reply_timeout, 0),
+                           NextState('WAIT_REPLY'))))
 
         fsm.act('WAIT_REPLY',
+                NextValue(reply_timeout, reply_timeout + 1),
                 If (rxstate.o_decoded,
                     If ((rxstate.o_pid & PIDTypes.TYPE_MASK) == PIDTypes.DATA,
                         NextState('RECV_DATA')
@@ -168,6 +187,9 @@ class UsbHostTransfer(Module):
                             self.o_got_ack.eq(rxstate.o_pid == PID.ACK),
                             self.o_got_nak.eq(rxstate.o_pid == PID.NAK),
                             self.o_got_stall.eq(rxstate.o_pid == PID.STALL))
+                ).Elif (reply_timeout >= reply_limit,
+                        self.o_timeout.eq(1),
+                        NextState('IDLE')
                 ).Elif(self.i_cmd_setup | self.i_cmd_in | self.i_cmd_out,
                        NextValue(low_speed_override, 0),
                        If (self.i_cmd_pre,
@@ -175,7 +197,6 @@ class UsbHostTransfer(Module):
                        ).Else (NextState('START_TRANSFER'))))
 
         fsm.act('RECV_DATA',
-                self.data_recv_put.eq(rx.o_data_strobe),
                 If(rx.o_pkt_end,
                    If (True,
                       NextState('END_DATA_LS')
@@ -211,7 +232,21 @@ class UsbHostTransfer(Module):
                     NextState('IDLE'))
 
         self.comb += [
-            self.data_recv_payload.eq(rx.o_data_payload),
+            recv_strobe.eq(fsm.ongoing('RECV_DATA') & rx.o_data_strobe),
+            self.data_recv_put.eq(recv_strobe & (recv_cnt == 2)),
+            self.data_recv_payload.eq(recv_b0),
+        ]
+        self.sync.usb_12 += [
+            If (~fsm.ongoing('RECV_DATA'),
+                recv_cnt.eq(0)
+            ).Elif (recv_strobe & (recv_cnt != 2),
+                    recv_cnt.eq(recv_cnt + 1)),
+            If (recv_strobe,
+                recv_b0.eq(recv_b1),
+                recv_b1.eq(rx.o_data_payload)),
+        ]
+
+        self.comb += [
             txstate.i_data_payload.eq(self.data_send_payload),
             txstate.i_data_ready.eq(self.data_send_have),
         ]
