@@ -132,7 +132,8 @@ class RxClockDataRecovery(Module):
         #
 
         # We 4x oversample, so make the line_state_phase have
-        # 4 possible values.
+        # 4 possible values.  In low speed mode we oversample 32x instead, so
+        # the phase counter needs 5 bits.
         line_state_phase = Signal(2 if low_speed is None else 5)
 
         self.line_state_valid = Signal()
@@ -141,8 +142,27 @@ class RxClockDataRecovery(Module):
         self.line_state_se0 = Signal()
         self.line_state_se1 = Signal()
 
+        # Where in the bit cell to sample.
+        #
+        # The phase counter is reset to 0 by a transition, so sampling at phase
+        # N latches the line N+1 clocks after the edge.  At full speed the cell
+        # is 4 clocks wide and phase 1 is its middle.  At low speed the cell is
+        # 32 clocks wide, and phase 1 is 6% in -- inside the edge transition
+        # itself, where a low speed driver (75-300ns rise/fall) has not settled
+        # and the pair can still read SE1.  Phase 15 puts it back in the middle.
+        #
+        # Getting this wrong does not break framing: SYNC re-aligns the phase on
+        # every edge, so short packets can still decode while longer runs of
+        # un-transitioned NRZI bits drift out of the cell.  It fails as
+        # intermittent, length-dependent corruption rather than a clean break.
+        sample_phase = Signal(5)
+        if low_speed is None:
+            self.comb += sample_phase.eq(1)
+        else:
+            self.comb += sample_phase.eq(Mux(low_speed, 15, 1))
+
         self.sync += [
-            self.line_state_valid.eq(line_state_phase == 1),
+            self.line_state_valid.eq(line_state_phase == sample_phase),
 
             If(line_state_dt,
                 # re-align the phase with the incoming transition

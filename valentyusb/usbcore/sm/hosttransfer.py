@@ -66,8 +66,11 @@ class UsbHostTransfer(Module):
         # one bit time is 8 clocks at low speed and 1 at full speed, so this is
         # 64 bit times either way -- comfortably more than the 16..18 the spec
         # requires, but far below the 1ms frame interval.
-        reply_timeout = Signal(10)
-        reply_limit = Signal(10)
+        # Widened from 10 bits: the same counter now also bounds RECV_DATA,
+        # which needs room for a whole data packet rather than a turnaround.
+        reply_timeout = Signal(14)
+        reply_limit = Signal(14)
+        data_limit = Signal(14)
         # R3: RECV_DATA strobes every decoded byte, including the two CRC16
         # bytes at the end of the packet.  Delay the payload by two bytes so
         # the CRC is still sitting in the skid when the packet ends.
@@ -104,6 +107,12 @@ class UsbHostTransfer(Module):
         self.sync.usb_12 += If(self.i_sof, sof_latch.eq(1))
 
         self.comb += reply_limit.eq(Mux(low_speed, 64*8, 64))
+
+        # Budget for receiving a whole data packet, in usb_12 ticks.  The
+        # largest is 8 sync + 8 pid + 512 data + 16 crc = 544 bits, which at low
+        # speed is 8 ticks per bit.  Rounded up generously -- this is a
+        # last-resort escape, not a protocol deadline.
+        self.comb += data_limit.eq(Mux(low_speed, 8192, 1024))
 
         fsm = ResetInserter()(FSM(reset_state='IDLE'))
         self.submodules.fsm = fsm = ClockDomainsRenamer('usb_12')(fsm)
@@ -182,6 +191,8 @@ class UsbHostTransfer(Module):
                 NextValue(reply_timeout, reply_timeout + 1),
                 If (rxstate.o_decoded,
                     If ((rxstate.o_pid & PIDTypes.TYPE_MASK) == PIDTypes.DATA,
+                        # restart the counter: it now bounds the data packet
+                        NextValue(reply_timeout, 0),
                         NextState('RECV_DATA')
                     ).Else (NextState('IDLE'),
                             self.o_got_ack.eq(rxstate.o_pid == PID.ACK),
@@ -197,10 +208,20 @@ class UsbHostTransfer(Module):
                        ).Else (NextState('START_TRANSFER'))))
 
         fsm.act('RECV_DATA',
+                NextValue(reply_timeout, reply_timeout + 1),
                 If(rx.o_pkt_end,
                    If (True,
                       NextState('END_DATA_LS')
-                   ).Else (NextState('END_DATA'))))
+                   ).Else (NextState('END_DATA'))
+                # Escape hatch.  Without this a truncated inbound packet parks
+                # the FSM here forever: it emits no event, so software sees a
+                # transfer that never completes, and it never returns to IDLE,
+                # so no later command can start either -- the same failure mode
+                # WAIT_REPLY had before it got a watchdog.  Report it as a
+                # timeout, which is what it looks like from software anyway.
+                ).Elif (reply_timeout >= data_limit,
+                        self.o_timeout.eq(1),
+                        NextState('IDLE')))
 
         fsm.delayed_enter('END_DATA_LS', 'END_DATA', 8)
 

@@ -116,7 +116,17 @@ class RxNRZIDecoder(Module):
                 If(self.i_valid,
                     last_data.eq(self.i_dk),
                     self.o_data.eq(~(self.i_dk ^ last_data)),
-                    self.o_se0.eq((~self.i_dj) & (~self.i_dk)),
+
+                    # Use the line state recovery's SE0, not "neither J nor K".
+                    #
+                    # The latter is also true for SE1, and RxPacketDetect treats
+                    # o_se0 as end-of-packet -- so a single SE1 sample aborts the
+                    # packet.  SE1 is illegal on a settled bus but occurs
+                    # routinely on low speed edges, where the 75-300ns rise/fall
+                    # spends several 48MHz clocks with both lines above V_IH.
+                    # Measured on hardware: 134 SE1 events in one low speed
+                    # capture, none at full speed.
+                    self.o_se0.eq(self.i_se0),
                 ),
                 self.o_valid.eq(self.i_valid),
             ]
