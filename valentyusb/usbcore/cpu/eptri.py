@@ -882,7 +882,16 @@ class InHandler(Module, AutoCSR):
                 self.ev.packet.trigger.eq(~queued & was_queued),
 
                 self.data_out.eq(buf.dout),
-                buf.re.eq(self.data_out_advance & is_in_packet_sys & is_our_packet),
+                # R6: buf.re is the READ enable of an AsyncFIFO whose read side
+                # is usb_12 ("read":"usb_12" above).  data_out_advance and
+                # is_our_packet are both usb_12; is_in_packet_sys is not -- it
+                # is MultiReg'd into sys and then used to gate a usb_12 strobe.
+                # The non-cdc branch below uses the usb_12 signal is_in_packet
+                # here, and so must this one.  Symptom: zero-length IN packets
+                # always went out (they never read the fifo) while every packet
+                # with a payload was dropped or truncated, so a device would
+                # answer SET_ADDRESS but never GET_DESCRIPTOR.
+                buf.re.eq(self.data_out_advance & is_in_packet & is_our_packet),
                 is_our_packet.eq(usb_core.endp == epno12),
                 is_our_packet_sys.eq(endp_sys == ctrl.fields.epno),
                 is_in_packet.eq(usb_core.tok == PID.IN),
